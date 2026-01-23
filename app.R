@@ -1,4 +1,4 @@
-# app.R — FPCA (PACE) bundle visualiser
+# app.R — FPCA visualiser
 # -----------------------------------
 # Expected fpca_bundle (.rds) fields:
 # scores (n x npc matrix), functions (funData), values (npc),
@@ -84,7 +84,7 @@ reconstruct_curve <- function(mu_vec, phi_mat, scores_row, K = NULL, pcs = NULL)
 # ---- UI ----
 
 ui <- fluidPage(
-  # JavaScript for copy to clipboard
+  # JavaScript for copy to clipboard and custom click handling
  tags$head(tags$script(HTML("
     Shiny.addCustomMessageHandler('copyToClipboard', function(text) {
       navigator.clipboard.writeText(text).then(function() {
@@ -101,7 +101,7 @@ ui <- fluidPage(
       });
     });
   "))),
-  titlePanel("FPCA (PACE) Bundle Visualiser"),
+  titlePanel("FPCA Visualiser"),
 
   sidebarLayout(
     sidebarPanel(
@@ -147,7 +147,9 @@ ui <- fluidPage(
                  fluidRow(
                    column(4,
                      h4("Point Selection"),
-                     helpText("Click points on the scatter plot to select/deselect them."),
+                     helpText("Click points on the scatter plot to select them. Click again to deselect."),
+                    uiOutput("selection_info"),
+                    tags$hr(),
                      radioButtons(
                        "recon_mode", "Reconstruction mode",
                        choices = c("Observation (use K PCs)" = "obs",
@@ -158,8 +160,7 @@ ui <- fluidPage(
                      fluidRow(
                        column(6, actionButton("clear_selection", "Clear All", width = "100%")),
                        column(6, actionButton("copy_selection", "Copy Names", width = "100%"))
-                     ),
-                     uiOutput("selection_info")
+                     )
                    ),
                    column(8,
                      uiOutput("recon_plot_ui")
@@ -177,12 +178,15 @@ server <- function(input, output, session) {
 
   fpca_bundle <- reactiveVal(NULL)
   selected_rowids <- reactiveVal(integer(0))  # multi-selection
+  live_crosshair <- reactiveVal(NULL)  # For real-time drag updates
+  plot_zoom <- reactiveVal(NULL)  # Preserve zoom state across re-renders
 
   observeEvent(input$rds_file, {
     req(input$rds_file)
     obj <- readRDS(input$rds_file$datapath)
     fpca_bundle(obj)
     selected_rowids(integer(0))  # clear selection on new file
+    plot_zoom(NULL)  # reset zoom on new file
   })
 
   # Clear selection button
@@ -394,10 +398,10 @@ server <- function(input, output, session) {
     tagList(
       tags$div(
         style = "margin-bottom: 8px;",
-        tags$strong(paste0("Selected (", length(ids), "):"))
+        tags$strong(paste0("Selected ", key_name, " (", length(ids), "):"))
       ),
       tags$div(
-        style = "display: flex; flex-wrap: wrap; align-items: center;",
+        style = "display: flex; flex-wrap: wrap; align-items: center; max-height: 200px; overflow-y: auto;",
         selected_items
       )
     )
@@ -654,6 +658,8 @@ server <- function(input, output, session) {
       plotly_symbols <- c("circle", "square", "diamond", "cross", "x", "triangle-up", "triangle-down", "star")
       symbol_map <- setNames(plotly_symbols[seq_along(shape_levels)], shape_levels)
       df$.symbol <- symbol_map[as.character(df[[shape_by]])]
+    } else {
+      df$.symbol <- "circle"  # default symbol
     }
 
     # Create consistent color mapping for color_by
@@ -734,6 +740,7 @@ server <- function(input, output, session) {
     }
 
     # Add highlight trace for selected points (with same source for click events)
+    # Use same symbol as original with transparent fill and black outline
     df_selected <- df[df$is_selected, , drop = FALSE]
     if (nrow(df_selected) > 0) {
       selected_tt <- tt[df$is_selected]
@@ -744,7 +751,8 @@ server <- function(input, output, session) {
         mode = "markers",
         marker = list(
           size = 14,
-          color = df_selected$.color,
+          symbol = df_selected$.symbol,
+          color = "rgba(0,0,0,0)",
           line = list(color = "black", width = 3)
         ),
         text = selected_tt,
@@ -757,10 +765,10 @@ server <- function(input, output, session) {
       )
     }
 
-    # Add crosshairs for slider position (use debounced values)
+    # Add crosshairs - use slider values (dot moves via JS during drag)
+    show_slider <- isTRUE(input$show_slider_recon)
     slider_x_val <- slider_x_debounced()
     slider_y_val <- slider_y_debounced()
-    show_slider <- isTRUE(input$show_slider_recon)
 
     xmin <- min(df[[xcol]], na.rm = TRUE)
     xmax <- max(df[[xcol]], na.rm = TRUE)
@@ -771,13 +779,7 @@ server <- function(input, output, session) {
     annotations <- list()
 
     if (show_slider && !is.null(slider_x_val) && !is.null(slider_y_val)) {
-      # Size for crosshair
-      x_range <- xmax - xmin
-      y_range <- ymax - ymin
-      cross_size_x <- x_range * 0.018
-      cross_size_y <- y_range * 0.018
-
-      # Vertical line as trace (cannot be dragged)
+      # Vertical line as trace
       p <- p %>% add_segments(
         x = slider_x_val, xend = slider_x_val,
         y = ymin - 0.1 * abs(ymax - ymin), yend = ymax + 0.1 * abs(ymax - ymin),
@@ -786,7 +788,7 @@ server <- function(input, output, session) {
         hoverinfo = "skip",
         inherit = FALSE
       )
-      # Horizontal line as trace (cannot be dragged)
+      # Horizontal line as trace
       p <- p %>% add_segments(
         x = xmin - 0.1 * abs(xmax - xmin), xend = xmax + 0.1 * abs(xmax - xmin),
         y = slider_y_val, yend = slider_y_val,
@@ -796,73 +798,276 @@ server <- function(input, output, session) {
         inherit = FALSE
       )
 
-      # Draggable crosshair point (small circle shape - only this is editable)
+      # Crosshair point - NOT editable, we handle dragging ourselves
       shapes[[1]] <- list(
         type = "circle",
-        x0 = slider_x_val - cross_size_x,
-        x1 = slider_x_val + cross_size_x,
-        y0 = slider_y_val - cross_size_y,
-        y1 = slider_y_val + cross_size_y,
+        xref = "x",
+        yref = "y",
+        xsizemode = "pixel",
+        ysizemode = "pixel",
+        xanchor = slider_x_val,
+        yanchor = slider_y_val,
+        x0 = -10,
+        x1 = 10,
+        y0 = -10,
+        y1 = 10,
         fillcolor = "rgba(255, 0, 0, 0.8)",
         line = list(color = "darkred", width = 2),
-        editable = TRUE
+        editable = FALSE
       )
     }
 
+    # Apply saved zoom state if available
+    zoom_state <- plot_zoom()
+    x_range <- if (!is.null(zoom_state)) zoom_state$x else NULL
+    y_range <- if (!is.null(zoom_state)) zoom_state$y else NULL
+
     p %>%
       layout(
-        xaxis = list(title = xcol),
-        yaxis = list(title = ycol),
-        dragmode = "select",
+        xaxis = list(title = xcol, range = x_range),
+        yaxis = list(title = ycol, range = y_range),
+        dragmode = "zoom",
         shapes = shapes,
         showlegend = TRUE
       ) %>%
-      config(edits = list(shapePosition = TRUE))
+      config(edits = list(shapePosition = FALSE)) %>%
+      htmlwidgets::onRender("
+        function(el, x) {
+          var gd = el;
+
+          // Capture zoom state changes
+          el.on('plotly_relayout', function(eventData) {
+            if (eventData) {
+              var xRange = eventData['xaxis.range[0]'] !== undefined ?
+                [eventData['xaxis.range[0]'], eventData['xaxis.range[1]']] : null;
+              var yRange = eventData['yaxis.range[0]'] !== undefined ?
+                [eventData['yaxis.range[0]'], eventData['yaxis.range[1]']] : null;
+
+              // Also check for autorange reset
+              if (eventData['xaxis.autorange'] || eventData['yaxis.autorange']) {
+                Shiny.setInputValue('plot_zoom_change', {
+                  x: null,
+                  y: null,
+                  timestamp: new Date().getTime()
+                }, {priority: 'event'});
+              } else if (xRange || yRange) {
+                Shiny.setInputValue('plot_zoom_change', {
+                  x: xRange,
+                  y: yRange,
+                  timestamp: new Date().getTime()
+                }, {priority: 'event'});
+              }
+            }
+          });
+
+          // Handle point clicks for selection
+          el.on('plotly_click', function(eventData) {
+            if (eventData && eventData.points && eventData.points.length > 0) {
+              var pt = eventData.points[0];
+              Shiny.setInputValue('scatter_click', {
+                x: pt.x,
+                y: pt.y,
+                timestamp: new Date().getTime()
+              }, {priority: 'event'});
+            }
+          });
+
+          // Custom crosshair dragging
+          var isDragging = false;
+          var lastUpdate = 0;
+          var throttleMs = 30;
+          var lastDragPos = null;
+          var savedDragmode = null;
+
+          // Helper to check if click is near crosshair
+          function isNearCrosshair(evt) {
+            var shapes = gd.layout.shapes;
+            if (!shapes || shapes.length === 0) return false;
+
+            var xaxis = gd._fullLayout.xaxis;
+            var yaxis = gd._fullLayout.yaxis;
+            if (!xaxis || !yaxis) return false;
+
+            var rect = el.getBoundingClientRect();
+            var clickX = evt.clientX - rect.left;
+            var clickY = evt.clientY - rect.top;
+
+            var shape = shapes[0];
+            var crossX = shape.xanchor;
+            var crossY = shape.yanchor;
+
+            var crossPixelX = xaxis.d2p(crossX) + xaxis._offset;
+            var crossPixelY = yaxis.d2p(crossY) + yaxis._offset;
+            var pixelDist = Math.sqrt(Math.pow(clickX - crossPixelX, 2) + Math.pow(clickY - crossPixelY, 2));
+
+            return pixelDist < 20;
+          }
+
+          // Mousedown handler - capture phase to intercept before plotly
+          el.addEventListener('mousedown', function(evt) {
+            if (!isNearCrosshair(evt)) return;
+
+            var shapes = gd.layout.shapes;
+            var shape = shapes[0];
+
+            isDragging = true;
+            lastDragPos = {x: shape.xanchor, y: shape.yanchor};
+
+            // Disable plotly's drag mode temporarily
+            savedDragmode = gd.layout.dragmode;
+            Plotly.relayout(gd, {dragmode: false});
+
+            evt.preventDefault();
+            evt.stopImmediatePropagation();
+          }, true);
+
+          document.addEventListener('mousemove', function(evt) {
+            if (!isDragging) return;
+            evt.preventDefault();
+
+            var now = Date.now();
+            if (now - lastUpdate < throttleMs) return;
+            lastUpdate = now;
+
+            var xaxis = gd._fullLayout.xaxis;
+            var yaxis = gd._fullLayout.yaxis;
+            if (!xaxis || !yaxis) return;
+
+            var rect = el.getBoundingClientRect();
+            var clickX = evt.clientX - rect.left;
+            var clickY = evt.clientY - rect.top;
+
+            var dataX = xaxis.p2d(clickX - xaxis._offset);
+            var dataY = yaxis.p2d(clickY - yaxis._offset);
+
+            // Clamp to axis range
+            dataX = Math.max(xaxis.range[0], Math.min(xaxis.range[1], dataX));
+            dataY = Math.max(yaxis.range[0], Math.min(yaxis.range[1], dataY));
+
+            lastDragPos = {x: dataX, y: dataY};
+
+            // Update shape position visually
+            Plotly.relayout(gd, {
+              'shapes[0].xanchor': dataX,
+              'shapes[0].yanchor': dataY
+            });
+
+            // Update reconstruction plot
+            Shiny.setInputValue('crosshair_dragging', {
+              x: dataX,
+              y: dataY
+            }, {priority: 'event'});
+          });
+
+          document.addEventListener('mouseup', function(evt) {
+            if (!isDragging) return;
+            isDragging = false;
+
+            // Restore dragmode
+            if (savedDragmode !== null) {
+              Plotly.relayout(gd, {dragmode: savedDragmode});
+              savedDragmode = null;
+            }
+
+            // Send final position
+            if (lastDragPos) {
+              Shiny.setInputValue('crosshair_drag_end', {
+                x: lastDragPos.x,
+                y: lastDragPos.y,
+                timestamp: new Date().getTime()
+              }, {priority: 'event'});
+            }
+          });
+        }
+      ")
   })
 
-  # Handle click to toggle point selection only
-  observeEvent(event_data("plotly_click", source = "scatter_main"), {
-    ed <- event_data("plotly_click", source = "scatter_main")
-    if (is.null(ed)) return()
+  # Handle click to toggle point selection
+  # Uses custom JS handler with timestamp to ensure every click is registered
+  observeEvent(input$scatter_click, {
+    click_data <- input$scatter_click
+    if (is.null(click_data)) return()
 
-    # Check if clicked on a data point (has valid key that's a row id)
-    clicked_key <- ed$key
-    has_valid_key <- !is.null(clicked_key) && length(clicked_key) > 0 &&
-                     !is.na(clicked_key[[1]]) && is.numeric(clicked_key[[1]])
+    clicked_x <- click_data$x
+    clicked_y <- click_data$y
 
-    if (has_valid_key) {
-      clicked_id <- as.integer(clicked_key[[1]])
-      current_sel <- selected_rowids()
+    # Skip if no valid coordinates
+    if (is.null(clicked_x) || is.null(clicked_y)) return()
 
-      if (clicked_id %in% current_sel) {
-        # Deselect
-        selected_rowids(setdiff(current_sel, clicked_id))
-      } else {
-        # Select
-        selected_rowids(c(current_sel, clicked_id))
-      }
+    df <- pcscores()
+    xcol <- input$x_pc
+    ycol <- input$y_pc
+
+    if (!(xcol %in% names(df)) || !(ycol %in% names(df))) return()
+
+    # Find the point closest to the clicked location
+    x_range <- max(df[[xcol]], na.rm = TRUE) - min(df[[xcol]], na.rm = TRUE)
+    y_range <- max(df[[ycol]], na.rm = TRUE) - min(df[[ycol]], na.rm = TRUE)
+
+    # Normalize distances to handle different axis scales
+    x_dist <- (df[[xcol]] - clicked_x) / max(x_range, 1e-10)
+    y_dist <- (df[[ycol]] - clicked_y) / max(y_range, 1e-10)
+    distances <- sqrt(x_dist^2 + y_dist^2)
+    min_idx <- which.min(distances)
+
+    # Only accept if the distance is reasonably small (within 5% of plot range)
+    if (length(min_idx) == 0 || distances[min_idx] >= 0.05) return()
+
+    clicked_id <- df$.rowid[min_idx]
+
+    # Toggle selection
+    current_sel <- selected_rowids()
+
+    if (clicked_id %in% current_sel) {
+      # Deselect
+      selected_rowids(setdiff(current_sel, clicked_id))
+    } else {
+      # Select (add to current selection)
+      selected_rowids(c(current_sel, clicked_id))
     }
-    # Note: crosshair is moved by dragging, not clicking
   })
 
-  # Handle crosshair drag (relayout) to update sliders
-  observeEvent(event_data("plotly_relayout", source = "scatter_main"), {
-    ed <- event_data("plotly_relayout", source = "scatter_main")
-    if (is.null(ed)) return()
+  # Handle zoom state changes - preserve across re-renders
+  observeEvent(input$plot_zoom_change, {
+    zoom_data <- input$plot_zoom_change
+    if (is.null(zoom_data)) return()
+    plot_zoom(list(x = zoom_data$x, y = zoom_data$y))
+  })
 
-    # The draggable circle is shapes[0] (first and only shape)
-    x0 <- ed$`shapes[0].x0`
-    x1 <- ed$`shapes[0].x1`
-    y0 <- ed$`shapes[0].y0`
-    y1 <- ed$`shapes[0].y1`
+  # Handle real-time crosshair dragging - update live position only (fast)
+  observeEvent(input$crosshair_dragging, {
+    drag_data <- input$crosshair_dragging
+    if (is.null(drag_data)) return()
+    live_crosshair(list(x = drag_data$x, y = drag_data$y))
+  })
 
-    if (!is.null(x0) && !is.null(x1) && !is.null(y0) && !is.null(y1)) {
-      new_x <- (x0 + x1) / 2
-      new_y <- (y0 + y1) / 2
+  # Handle drag end - update live position and sliders
+  observeEvent(input$crosshair_drag_end, {
+    drag_data <- input$crosshair_drag_end
+    if (is.null(drag_data)) return()
+
+    new_x <- drag_data$x
+    new_y <- drag_data$y
+
+    if (!is.null(new_x) && !is.null(new_y)) {
+      # Keep live_crosshair at final position to prevent flash
+      live_crosshair(list(x = new_x, y = new_y))
       updateSliderInput(session, "slider_x", value = new_x)
       updateSliderInput(session, "slider_y", value = new_y)
     }
   })
+
+
+  # Clear live_crosshair when user manually adjusts sliders
+  observeEvent(c(input$slider_x, input$slider_y), {
+    live_pos <- live_crosshair()
+    if (!is.null(live_pos) && !is.null(input$slider_x) && !is.null(input$slider_y)) {
+      # If slider values differ from live position, user adjusted manually
+      if (abs(input$slider_x - live_pos$x) > 0.01 || abs(input$slider_y - live_pos$y) > 0.01) {
+        live_crosshair(NULL)
+      }
+    }
+  }, ignoreInit = TRUE)
   
   output$recon_plot <- renderPlot({
     req(bundle_ok())
@@ -892,23 +1097,33 @@ server <- function(input, output, session) {
     # Start building plot data
     plot_data <- tibble(time = time_vals, y = mu_vec, label = "Mean", type = "mean", color_group = "Mean")
 
-    # Slider-based reconstruction (use direct values for fast response)
+    # Crosshair-based reconstruction
+    # Use live_crosshair if dragging, otherwise use slider values
     show_slider <- isTRUE(input$show_slider_recon)
-    slider_x_val <- input$slider_x
-    slider_y_val <- input$slider_y
+    live_pos <- live_crosshair()
 
-    if (show_slider && !is.null(slider_x_val) && !is.null(slider_y_val)) {
-      # Create a synthetic scores row with slider values for selected PCs
+    if (!is.null(live_pos)) {
+      # Use live drag position (fast path)
+      crosshair_x <- live_pos$x
+      crosshair_y <- live_pos$y
+    } else {
+      # Use slider values
+      crosshair_x <- input$slider_x
+      crosshair_y <- input$slider_y
+    }
+
+    if (show_slider && !is.null(crosshair_x) && !is.null(crosshair_y)) {
+      # Create a synthetic scores row with crosshair values for selected PCs
       slider_scores <- rep(0, p)
-      slider_scores[ax] <- slider_x_val
-      slider_scores[ay] <- slider_y_val
+      slider_scores[ax] <- crosshair_x
+      slider_scores[ay] <- crosshair_y
 
       slider_recon <- reconstruct_curve(mu_vec, phi_mat, slider_scores, pcs = c(ax, ay))
-      slider_label <- paste0("Slider (", input$x_pc, "=", round(slider_x_val, 2),
-                             ", ", input$y_pc, "=", round(slider_y_val, 2), ")")
+      slider_label <- paste0("Crosshair (", input$x_pc, "=", round(crosshair_x, 2),
+                             ", ", input$y_pc, "=", round(crosshair_y, 2), ")")
       plot_data <- bind_rows(
         plot_data,
-        tibble(time = time_vals, y = slider_recon, label = slider_label, type = "slider", color_group = "Slider")
+        tibble(time = time_vals, y = slider_recon, label = slider_label, type = "slider", color_group = "Crosshair")
       )
     }
 
@@ -983,11 +1198,11 @@ server <- function(input, output, session) {
     }
 
     # Build full color map
-    color_map <- c("Mean" = "gray40", "Slider" = "red")
+    color_map <- c("Mean" = "gray40", "Crosshair" = "red")
     color_map <- c(color_map, group_colors)
 
     # Create linetype map
-    linetype_map <- c("Mean" = "dashed", "Slider" = "solid")
+    linetype_map <- c("Mean" = "dashed", "Crosshair" = "solid")
     for (grp in unique_color_groups) {
       linetype_map[grp] <- "solid"
     }
