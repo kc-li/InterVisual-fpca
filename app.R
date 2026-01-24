@@ -107,31 +107,211 @@ ui <- fluidPage(
     sidebarPanel(
       fileInput("rds_file", "Load fpca_bundle (.rds)", accept = c(".rds")),
 
-      tags$hr(),
-      h4("Scores scatter"),
-      uiOutput("xy_select_ui"),
-      uiOutput("aes_select_ui"),
+      # Only show these controls when on the "Scores + Reconstruction" tab
+      conditionalPanel(
+        condition = "input.main_tabs == 'Scores + Reconstruction'",
 
-      tags$hr(),
-      h4("Interactive Reconstruction"),
+        tags$hr(),
+        h4("Scores scatter"),
+        uiOutput("xy_select_ui"),
+        uiOutput("aes_select_ui"),
 
-      # Slider-based reconstruction controls
-      checkboxInput("show_slider_recon", "Show slider-based reconstruction", value = TRUE),
-      uiOutput("slider_x_ui"),
-      uiOutput("slider_y_ui"),
+        tags$hr(),
+        h4("Interactive Reconstruction"),
 
-      tags$hr(),
-      h4("Plot Settings"),
-      fluidRow(
-        column(6, numericInput("scatter_height", "Scatter height (px)", value = 480, min = 200, max = 1000, step = 20)),
-        column(6, numericInput("recon_height", "Recon height (px)", value = 320, min = 150, max = 800, step = 20))
-      ),
-      uiOutput("recon_ylim_ui"),
+        # Slider-based reconstruction controls
+        checkboxInput("show_slider_recon", "Show slider-based reconstruction", value = TRUE),
+        uiOutput("slider_x_ui"),
+        uiOutput("slider_y_ui"),
 
+        tags$hr(),
+        h4("Plot Settings"),
+        fluidRow(
+          column(6, numericInput("scatter_height", "Scatter height (px)", value = 480, min = 200, max = 1000, step = 20)),
+          column(6, numericInput("recon_height", "Recon height (px)", value = 320, min = 150, max = 800, step = 20))
+        ),
+        uiOutput("recon_ylim_ui")
+      )
     ),
 
     mainPanel(
       tabsetPanel(
+        id = "main_tabs",
+        tabPanel("Instruction",
+                 tags$div(
+                   style = "max-width: 900px; padding: 20px;",
+
+                   h2("Saving an FPCA (PACE) Result Bundle"),
+                   p("This document describes a clean, reproducible way to ", tags$strong("bundle and save FPCA (PACE) results"),
+                     " together with metadata into a single ", tags$code(".rds"), " file, suitable for downstream visualization (e.g. this Shiny app), reconstruction, and statistical analysis."),
+
+                   tags$hr(),
+
+                   h3("Purpose"),
+                   p("The goal of ", tags$code("save_fpca_pace_bundle()"), " is to:"),
+                   tags$ul(
+                     tags$li("Collect all ", tags$strong("essential FPCA outputs"), " (scores, eigenfunctions, eigenvalues, mean curve)."),
+                     tags$li("Preserve a ", tags$strong("stable mapping"), " between FPCA scores and original curve IDs."),
+                     tags$li("Optionally attach ", tags$strong("metadata"), " (speaker, condition, tone, etc.) in a safe and mergeable way."),
+                     tags$li("Save everything into ", tags$strong("one portable ", tags$code(".rds"), " object"), ".")
+                   ),
+                   p("This avoids re-running FPCA and prevents common alignment bugs later."),
+
+                   tags$hr(),
+
+                   h3("What the bundle contains"),
+                   p("The saved ", tags$code(".rds"), " file is a named list with (at minimum):"),
+                   tags$ul(
+                     tags$li(tags$code("scores"), " \u2014 Numeric matrix ", tags$code("[n_observations \u00d7 npc]"), " of FPCA scores."),
+                     tags$li(tags$code("functions"), " \u2014 ", tags$code("funData"), " object containing FPCA eigenfunctions (PC dimensions)."),
+                     tags$li(tags$code("values"), " \u2014 Numeric vector of eigenvalues (length = ", tags$code("npc"), ")."),
+                     tags$li(tags$code("mu"), " \u2014 ", tags$code("funData"), " object representing the ", tags$strong("mean curve"), ". This is required for meaningful reconstruction: ",
+                             tags$em("\u0177(t) = \u03bc(t) + \u03a3 s_k \u03c6_k(t)")),
+                     tags$li(tags$code("fit, estVar, npc, sigma2"), " \u2014 Additional FPCA outputs saved as-is."),
+                     tags$li(tags$code("file_order"), " \u2014 Character vector (length = ", tags$code("n_observations"), ") mapping each row of ", tags$code("scores"), " to a curve ID."),
+                     tags$li(tags$code("meta"), " (optional) \u2014 A data frame with one row per curve, containing metadata."),
+                     tags$li(tags$code("map_col"), " \u2014 Name of the ID column in ", tags$code("meta"), " used to match ", tags$code("file_order"), " (default: ", tags$code('"File"'), ")."),
+                     tags$li(tags$code("created_at"), " \u2014 Timestamp of bundle creation.")
+                   ),
+
+                   tags$hr(),
+
+                   h3("The save function"),
+                   tags$pre(
+                     style = "background-color: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto; font-size: 12px;",
+'save_fpca_pace_bundle <- function(
+  fpca_pace,
+  file_order,
+  meta_df = NULL,
+  map_col = "File",
+  out_file = "fpca_pace_bundle.rds"
+) {
+  # ---- basic checks ----
+  stopifnot(
+    is.matrix(fpca_pace$scores),
+    is.character(file_order),
+    length(file_order) == nrow(fpca_pace$scores),
+    is.character(map_col),
+    length(map_col) == 1
+  )
+
+  # ---- FPCA object checks ----
+  stopifnot(
+    !is.null(fpca_pace$functions),
+    methods::is(fpca_pace$functions, "funData"),
+    !is.null(fpca_pace$values),
+    length(fpca_pace$values) == ncol(fpca_pace$scores),
+    !is.null(fpca_pace$mu),
+    methods::is(fpca_pace$mu, "funData")
+  )
+
+  # ---- optional metadata checks ----
+  if (!is.null(meta_df)) {
+    stopifnot(is.data.frame(meta_df))
+    stopifnot(map_col %in% colnames(meta_df))
+
+    key <- meta_df[[map_col]]
+
+    # enforce exactly one row per key
+    stopifnot(nrow(meta_df) == length(unique(key)))
+
+    # ensure metadata covers all keys
+    missing_keys <- setdiff(file_order, key)
+    if (length(missing_keys) > 0) {
+      stop(
+        "meta_df is missing key(s) in column \'", map_col, "\': ",
+        paste(missing_keys, collapse = ", ")
+      )
+    }
+  }
+
+  # ---- bundle ----
+  fpca_bundle <- list(
+    # core FPCA outputs
+    scores    = fpca_pace$scores,
+    functions = fpca_pace$functions,
+    values    = fpca_pace$values,
+    mu        = fpca_pace$mu,
+
+    # additional outputs
+    fit       = fpca_pace$fit,
+    estVar    = fpca_pace$estVar,
+    npc       = fpca_pace$npc,
+    sigma2    = fpca_pace$sigma2,
+
+    # bookkeeping
+    file_order = file_order,
+    meta       = meta_df,
+    map_col    = map_col,
+    created_at = Sys.time()
+  )
+
+  saveRDS(fpca_bundle, out_file)
+  invisible(fpca_bundle)
+}'
+                   ),
+
+                   tags$hr(),
+
+                   h3("Example Usage"),
+
+                   h4("1. Prepare file_order"),
+                   p(tags$code("file_order"), " defines the mapping between rows of ", tags$code("fpca_pace$scores"),
+                     " and your original curves. It must be in the same order as the data used to build the FPCA input."),
+                   tags$pre(
+                     style = "background-color: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto; font-size: 12px;",
+'file_order <- curves %>%
+  dplyr::distinct(File) %>%
+  dplyr::pull(File)'
+                   ),
+                   tags$div(
+                     style = "background-color: #fff3cd; padding: 10px; border-radius: 5px; margin: 10px 0;",
+                     tags$strong("Important: "), "If you filtered or reordered curves before creating the FPCA object, do the same here."
+                   ),
+
+                   h4("2. Prepare meta_df"),
+                   p(tags$code("meta_df"), " should:"),
+                   tags$ul(
+                     tags$li("Have one row per curve."),
+                     tags$li("Contain no time-varying columns (no ", tags$code("time"), ", ", tags$code("f0"), ", etc.)."),
+                     tags$li("Convert categorical variables to ", tags$code("factor"), " (recommended).")
+                   ),
+                   tags$pre(
+                     style = "background-color: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto; font-size: 12px;",
+'meta <- curves %>%
+  dplyr::select(-any_of(c("Timepoint", "time", "f0_semi"))) %>%
+  dplyr::distinct(File, .keep_all = TRUE) %>%
+  mutate(
+    Speaker    = as.factor(Speaker),
+    gender     = as.factor(gender),
+    Tone       = as.factor(Tone),
+    Syllable   = as.factor(Syllable),
+    Intonation = as.factor(Intonation)
+  )'
+                   ),
+                   tags$div(
+                     style = "background-color: #d1ecf1; padding: 10px; border-radius: 5px; margin: 10px 0;",
+                     tags$strong("Why factors?"),
+                     tags$ul(
+                       tags$li("Ensures correct discrete color/shape scales in ggplot."),
+                       tags$li("Avoids accidental treatment as continuous variables."),
+                       tags$li("Plays nicely with mixed-effects models later.")
+                     )
+                   ),
+
+                   h4("3. Save the bundle"),
+                   tags$pre(
+                     style = "background-color: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto; font-size: 12px;",
+'save_fpca_pace_bundle(
+  fpca_pace  = fpca_pace,
+  file_order = file_order,
+  meta_df    = meta,
+  map_col    = "File",
+  out_file   = "data/fpca_pace_bundle.rds"
+)'
+                   )
+                 )
+        ),
         tabPanel("Summary",
                  verbatimTextOutput("bundle_info"),
                  plotlyOutput("var_bar", height = 260),
@@ -141,7 +321,7 @@ ui <- fluidPage(
                  plotOutput("eigen_plot", height = 320),
                  plotOutput("pc_effect_plot", height = 320)
         ),
-        tabPanel("Scores + Metadata",
+        tabPanel("Scores + Reconstruction",
                  uiOutput("scatter_plot_ui"),
                  tags$hr(),
                  fluidRow(

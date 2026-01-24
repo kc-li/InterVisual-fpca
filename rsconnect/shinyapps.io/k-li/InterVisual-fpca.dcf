@@ -5,9 +5,9 @@ account: k-li
 server: shinyapps.io
 hostUrl: https://api.shinyapps.io/v1
 appId: 16487666
-bundleId: 11480829
+bundleId: 11486896
 url: https://k-li.shinyapps.io/InterVisual-fpca/
 version: 1
 asMultiple: FALSE
 asStatic: FALSE
-ignoredFiles: .claude/settings.local.json|README.md
+ignoredFiles: .claude/settings.local.json|.RData|Instruction.md|README.md
