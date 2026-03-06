@@ -13,7 +13,8 @@ library(ggplot2)
 library(plotly)
 library(DT)
 library(scales)
-library(ggrepel)
+library(MFPCA)
+library(funData)
 
 # ---- helpers ----
 
@@ -106,6 +107,8 @@ ui <- fluidPage(
   sidebarLayout(
     sidebarPanel(
       fileInput("rds_file", "Load fpca_bundle (.rds)", accept = c(".rds")),
+      actionButton("load_example", "Load Example Dataset", width = "100%"),
+      tags$hr(),
 
       # Only show these controls when on the "Scores + Reconstruction" tab
       conditionalPanel(
@@ -121,6 +124,7 @@ ui <- fluidPage(
 
         # Slider-based reconstruction controls
         checkboxInput("show_slider_recon", "Show slider-based reconstruction", value = TRUE),
+        p("You can also move the red dot in the figure, but note that the real-time reconstruction is slow online."),
         uiOutput("slider_x_ui"),
         uiOutput("slider_y_ui"),
 
@@ -140,46 +144,92 @@ ui <- fluidPage(
         tabPanel("Instruction",
                  tags$div(
                    style = "max-width: 900px; padding: 20px;",
-
-                   h2("Saving an FPCA (PACE) Result Bundle"),
-                   p("This document describes a clean, reproducible way to ", tags$strong("bundle and save FPCA (PACE) results"),
-                     " together with metadata into a single ", tags$code(".rds"), " file, suitable for downstream visualization (e.g. this Shiny app), reconstruction, and statistical analysis."),
+                   
+                   h2("Purpose of the tool"),
+                   p("This tool provides interactive visualisation of FPCA results, enabling examination of PC score distributions and direct visualisation of reconstructed curves of selected observations. It is particularly useful for interpreting results and identifying outliers."),
+                   p("Currently, it supports one-dimensional FPCA computed via the PACE algorithm."),
+                   
+                   tags$hr(),
+                   
+                   h2("How to save an FPCA bundle?"),
+                   p("This tool requires uploading an FPCA result bundle as an ", tags$code(".rds"), " file. The steps below describe how to prepare and save one."),
+                   p("You can also load the example dataset to proceed."),
 
                    tags$hr(),
 
-                   h3("Purpose"),
-                   p("The goal of ", tags$code("save_fpca_pace_bundle()"), " is to:"),
+                   h3("1. Run FPCA analysis"),
+                   tags$pre(
+                     style = "background-color: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto; font-size: 12px;",
+                     'raw.data <- read.csv("data/combine.csv") %>% dplyr::select("File", "Timepoint", "time", "Speaker", "gender", "Tone", "Syllable", "Intonation", "f0_semi")
+
+curves <- raw.data %>%
+  arrange(File, Timepoint)
+
+stopifnot(!anyNA(curves$File), !anyNA(curves$Timepoint), !anyNA(curves$f0_semi))
+
+# Functional data object, only the essential matrix
+curvesFun <- long2irregFunData(curves, id = "File", time = "Timepoint", value = "f0_semi") %>% 
+  as.funData()
+
+# explicit file order
+file_order <- curves %>%
+  distinct(File) %>%
+  pull(File)
+
+# Compute FPCA
+fpca_pace <- PACE(curvesFun)'
+                   ),
+                   
+                   h3("2. Prepare file_order"),
+                   p(tags$code("file_order"), " defines the mapping between rows of ", tags$code("fpca_pace$scores"),
+                     " and your original curves. It must be in the same order as the data used to build the FPCA input."),
+                   tags$pre(
+                     style = "background-color: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto; font-size: 12px;",
+                     'file_order <- curves %>%
+  dplyr::distinct(File) %>%
+  dplyr::pull(File)'
+                   ),
+                   tags$div(
+                     style = "background-color: #fff3cd; padding: 10px; border-radius: 5px; margin: 10px 0;",
+                     tags$strong("Important: "), "If you filtered or reordered curves before creating the FPCA object, do the same here."
+                   ),
+                   
+                   h3("3. Prepare meta_df (optional)"),
+                   p(tags$code("meta_df"), " should:"),
+                   tags$ul(
+                     tags$li("Have one row per curve."),
+                     tags$li("Contain no time-varying columns (no ", tags$code("time"), ", ", tags$code("f0"), ", etc.)."),
+                     tags$li("Convert categorical variables to ", tags$code("factor"), " (recommended).")
+                   ),
+                   tags$pre(
+                     style = "background-color: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto; font-size: 12px;",
+                     'meta <- curves %>%
+  dplyr::select(-any_of(c("Timepoint", "time", "f0_semi"))) %>%
+  dplyr::distinct(File, .keep_all = TRUE) %>%
+  mutate(
+    Speaker    = as.factor(Speaker),
+    gender     = as.factor(gender),
+    Tone       = as.factor(Tone),
+    Syllable   = as.factor(Syllable),
+    Intonation = as.factor(Intonation)
+  )'
+                   ),
+                   
+
+                   h3("4. Save the bundle"),
+                   
+                   h4("The save function"),
+                   p("Run the following save function in R. The goal of ", tags$code("save_fpca_pace_bundle()"), " is to:"),
                    tags$ul(
                      tags$li("Collect all ", tags$strong("essential FPCA outputs"), " (scores, eigenfunctions, eigenvalues, mean curve)."),
                      tags$li("Preserve a ", tags$strong("stable mapping"), " between FPCA scores and original curve IDs."),
                      tags$li("Optionally attach ", tags$strong("metadata"), " (speaker, condition, tone, etc.) in a safe and mergeable way."),
                      tags$li("Save everything into ", tags$strong("one portable ", tags$code(".rds"), " object"), ".")
                    ),
-                   p("This avoids re-running FPCA and prevents common alignment bugs later."),
-
-                   tags$hr(),
-
-                   h3("What the bundle contains"),
-                   p("The saved ", tags$code(".rds"), " file is a named list with (at minimum):"),
-                   tags$ul(
-                     tags$li(tags$code("scores"), " \u2014 Numeric matrix ", tags$code("[n_observations \u00d7 npc]"), " of FPCA scores."),
-                     tags$li(tags$code("functions"), " \u2014 ", tags$code("funData"), " object containing FPCA eigenfunctions (PC dimensions)."),
-                     tags$li(tags$code("values"), " \u2014 Numeric vector of eigenvalues (length = ", tags$code("npc"), ")."),
-                     tags$li(tags$code("mu"), " \u2014 ", tags$code("funData"), " object representing the ", tags$strong("mean curve"), ". This is required for meaningful reconstruction: ",
-                             tags$em("\u0177(t) = \u03bc(t) + \u03a3 s_k \u03c6_k(t)")),
-                     tags$li(tags$code("fit, estVar, npc, sigma2"), " \u2014 Additional FPCA outputs saved as-is."),
-                     tags$li(tags$code("file_order"), " \u2014 Character vector (length = ", tags$code("n_observations"), ") mapping each row of ", tags$code("scores"), " to a curve ID."),
-                     tags$li(tags$code("meta"), " (optional) \u2014 A data frame with one row per curve, containing metadata."),
-                     tags$li(tags$code("map_col"), " \u2014 Name of the ID column in ", tags$code("meta"), " used to match ", tags$code("file_order"), " (default: ", tags$code('"File"'), ")."),
-                     tags$li(tags$code("created_at"), " \u2014 Timestamp of bundle creation.")
-                   ),
-
-                   tags$hr(),
-
-                   h3("The save function"),
+                   
                    tags$pre(
                      style = "background-color: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto; font-size: 12px;",
-'save_fpca_pace_bundle <- function(
+                     'save_fpca_pace_bundle <- function(
   fpca_pace,
   file_order,
   meta_df = NULL,
@@ -251,55 +301,21 @@ ui <- fluidPage(
 }'
                    ),
 
-                   tags$hr(),
-
-                   h3("Example Usage"),
-
-                   h4("1. Prepare file_order"),
-                   p(tags$code("file_order"), " defines the mapping between rows of ", tags$code("fpca_pace$scores"),
-                     " and your original curves. It must be in the same order as the data used to build the FPCA input."),
-                   tags$pre(
-                     style = "background-color: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto; font-size: 12px;",
-'file_order <- curves %>%
-  dplyr::distinct(File) %>%
-  dplyr::pull(File)'
-                   ),
-                   tags$div(
-                     style = "background-color: #fff3cd; padding: 10px; border-radius: 5px; margin: 10px 0;",
-                     tags$strong("Important: "), "If you filtered or reordered curves before creating the FPCA object, do the same here."
-                   ),
-
-                   h4("2. Prepare meta_df"),
-                   p(tags$code("meta_df"), " should:"),
+                   p("The saved ", tags$code(".rds"), " file is a named list with (at minimum):"),
                    tags$ul(
-                     tags$li("Have one row per curve."),
-                     tags$li("Contain no time-varying columns (no ", tags$code("time"), ", ", tags$code("f0"), ", etc.)."),
-                     tags$li("Convert categorical variables to ", tags$code("factor"), " (recommended).")
-                   ),
-                   tags$pre(
-                     style = "background-color: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto; font-size: 12px;",
-'meta <- curves %>%
-  dplyr::select(-any_of(c("Timepoint", "time", "f0_semi"))) %>%
-  dplyr::distinct(File, .keep_all = TRUE) %>%
-  mutate(
-    Speaker    = as.factor(Speaker),
-    gender     = as.factor(gender),
-    Tone       = as.factor(Tone),
-    Syllable   = as.factor(Syllable),
-    Intonation = as.factor(Intonation)
-  )'
-                   ),
-                   tags$div(
-                     style = "background-color: #d1ecf1; padding: 10px; border-radius: 5px; margin: 10px 0;",
-                     tags$strong("Why factors?"),
-                     tags$ul(
-                       tags$li("Ensures correct discrete color/shape scales in ggplot."),
-                       tags$li("Avoids accidental treatment as continuous variables."),
-                       tags$li("Plays nicely with mixed-effects models later.")
-                     )
+                     tags$li(tags$code("scores"), " \u2014 Numeric matrix ", tags$code("[n_observations \u00d7 npc]"), " of FPCA scores."),
+                     tags$li(tags$code("functions"), " \u2014 ", tags$code("funData"), " object containing FPCA eigenfunctions (PC dimensions)."),
+                     tags$li(tags$code("values"), " \u2014 Numeric vector of eigenvalues (length = ", tags$code("npc"), ")."),
+                     tags$li(tags$code("mu"), " \u2014 ", tags$code("funData"), " object representing the ", tags$strong("mean curve"), ". This is required for meaningful reconstruction: ",
+                             tags$em("\u0177(t) = \u03bc(t) + \u03a3 s_k \u03c6_k(t)")),
+                     tags$li(tags$code("fit, estVar, npc, sigma2"), " \u2014 Additional FPCA outputs saved as-is."),
+                     tags$li(tags$code("file_order"), " \u2014 Character vector (length = ", tags$code("n_observations"), ") mapping each row of ", tags$code("scores"), " to a curve ID."),
+                     tags$li(tags$code("meta"), " (optional) \u2014 A data frame with one row per curve, containing metadata."),
+                     tags$li(tags$code("map_col"), " \u2014 Name of the ID column in ", tags$code("meta"), " used to match ", tags$code("file_order"), " (default: ", tags$code('"File"'), ")."),
+                     tags$li(tags$code("created_at"), " \u2014 Timestamp of bundle creation.")
                    ),
 
-                   h4("3. Save the bundle"),
+                   h4("Running the save function"),
                    tags$pre(
                      style = "background-color: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto; font-size: 12px;",
 'save_fpca_pace_bundle(
@@ -329,6 +345,10 @@ ui <- fluidPage(
                      h4("Point Selection"),
                      helpText("Click points on the scatter plot to select them. Click again to deselect."),
                     uiOutput("selection_info"),
+                    fluidRow(
+                      column(6, actionButton("clear_selection", "Clear All", width = "100%")),
+                      column(6, actionButton("copy_selection", "Copy Names", width = "100%"))
+                    ),
                     tags$hr(),
                      radioButtons(
                        "recon_mode", "Reconstruction mode",
@@ -336,11 +356,10 @@ ui <- fluidPage(
                                    "Axis-only (use selected x/y PCs)" = "axis"),
                        selected = "axis"
                      ),
-                     numericInput("K", "K (number of PCs)", value = 5, min = 1, max = 10, step = 1),
-                     fluidRow(
-                       column(6, actionButton("clear_selection", "Clear All", width = "100%")),
-                       column(6, actionButton("copy_selection", "Copy Names", width = "100%"))
-                     )
+                     conditionalPanel(
+                       condition = "input.recon_mode == 'obs'",
+                       numericInput("K", "K (number of PCs)", value = 5, min = 1, max = 10, step = 1)
+                     ),
                    ),
                    column(8,
                      uiOutput("recon_plot_ui")
@@ -359,6 +378,7 @@ server <- function(input, output, session) {
   fpca_bundle <- reactiveVal(NULL)
   selected_rowids <- reactiveVal(integer(0))  # multi-selection
   live_crosshair <- reactiveVal(NULL)  # For real-time drag updates
+  drag_end_time <- reactiveVal(0)  # Timestamp when drag ended (to ignore late events)
   plot_zoom <- reactiveVal(NULL)  # Preserve zoom state across re-renders
 
   observeEvent(input$rds_file, {
@@ -367,6 +387,19 @@ server <- function(input, output, session) {
     fpca_bundle(obj)
     selected_rowids(integer(0))  # clear selection on new file
     plot_zoom(NULL)  # reset zoom on new file
+  })
+
+  observeEvent(input$load_example, {
+    path <- "data/example_bundle.rds"
+    if (!file.exists(path)) {
+      showNotification("Example file not found: data/example_bundle.rds", type = "error")
+      return()
+    }
+    obj <- readRDS(path)
+    fpca_bundle(obj)
+    selected_rowids(integer(0))
+    plot_zoom(NULL)
+    showNotification("Example dataset loaded.", type = "message", duration = 4)
   })
 
   # Clear selection button
@@ -523,15 +556,19 @@ server <- function(input, output, session) {
   output$selection_info <- renderUI({
     ids <- selected_rowids()
     if (length(ids) == 0) {
-      return(helpText("No points selected. Click on points in the scatter plot to select them."))
+      return(helpText("No points selected."))
     }
     df <- pcscores()
     key_name <- map_col()
     color_by <- input$color_by
-    use_color_by <- !is.null(color_by) && nzchar(color_by) && (color_by %in% names(df))
+    use_color_by <- is.character(color_by) &&
+      length(color_by) == 1 &&
+      !is.na(color_by) &&
+      nzchar(color_by) &&
+      (color_by %in% names(df))
 
     # Get color palette for consistent coloring
-    if (use_color_by) {
+    if (isTRUE(use_color_by)) {
       all_color_levels <- unique(as.character(df[[color_by]]))
       all_colors <- get_color_palette(length(all_color_levels))
       names(all_colors) <- all_color_levels
@@ -545,7 +582,7 @@ server <- function(input, output, session) {
       key_val <- df[[key_name]][idx]
 
       # Get color for this item
-      if (use_color_by) {
+      if (isTRUE(use_color_by)) {
         color_val <- as.character(df[[color_by]][idx])
         bg_color <- all_colors[color_val]
       } else {
@@ -688,7 +725,27 @@ server <- function(input, output, session) {
     cat("n observations:", nrow(b$scores), "\n")
     cat("npc:", p, "\n")
     cat("map_col:", map_col(), "\n")
-    cat("meta present:", !is.null(b$meta), "\n")
+    if (!is.null(b$meta)) {
+      cat("meta present: TRUE\n")
+      col_types <- sapply(b$meta, function(x) {
+        if (is.factor(x))    "factor"
+        else if (is.integer(x)) "integer"
+        else if (is.numeric(x)) "numeric"
+        else if (is.logical(x)) "logical"
+        else                    "character"
+      })
+      cat("meta variables:\n")
+      for (nm in names(col_types)) {
+        extra <- if (col_types[nm] == "factor") {
+          lvls <- levels(b$meta[[nm]])
+          paste0("  [", length(lvls), " levels: ", paste(head(lvls, 5), collapse = ", "),
+                 if (length(lvls) > 5) ", ..." else "", "]")
+        } else ""
+        cat(sprintf("  %-20s %s%s\n", nm, col_types[nm], extra))
+      }
+    } else {
+      cat("meta present: FALSE\n")
+    }
     if (!is.null(b$created_at)) cat("created_at:", as.character(b$created_at), "\n")
   })
   
@@ -940,8 +997,7 @@ server <- function(input, output, session) {
         key = df_selected$.rowid,
         name = "Selected",
         showlegend = FALSE,
-        inherit = FALSE,
-        source = "scatter_main"
+        inherit = FALSE
       )
     }
 
@@ -1218,19 +1274,29 @@ server <- function(input, output, session) {
   observeEvent(input$crosshair_dragging, {
     drag_data <- input$crosshair_dragging
     if (is.null(drag_data)) return()
+
+    # Ignore late events that arrive within 150ms of drag_end
+    # These are queued events from before mouseup
+    time_since_drag_end <- as.numeric(Sys.time()) - drag_end_time()
+    if (time_since_drag_end < 0.15) return()
+
     live_crosshair(list(x = drag_data$x, y = drag_data$y))
   })
 
-  # Handle drag end - update live position and sliders
+  # Handle drag end - update sliders, keep live_crosshair until sliders catch up
   observeEvent(input$crosshair_drag_end, {
     drag_data <- input$crosshair_drag_end
     if (is.null(drag_data)) return()
+
+    # Record drag end time to ignore late dragging events
+    drag_end_time(as.numeric(Sys.time()))
 
     new_x <- drag_data$x
     new_y <- drag_data$y
 
     if (!is.null(new_x) && !is.null(new_y)) {
       # Keep live_crosshair at final position to prevent flash
+      # It will be cleared by slider observer once sliders catch up
       live_crosshair(list(x = new_x, y = new_y))
       updateSliderInput(session, "slider_x", value = new_x)
       updateSliderInput(session, "slider_y", value = new_y)
@@ -1238,19 +1304,31 @@ server <- function(input, output, session) {
   })
 
 
-  # Clear live_crosshair when user manually adjusts sliders
+  # Clear live_crosshair when sliders catch up after drag, or user manually adjusts
+
   observeEvent(c(input$slider_x, input$slider_y), {
     live_pos <- live_crosshair()
-    if (!is.null(live_pos) && !is.null(input$slider_x) && !is.null(input$slider_y)) {
-      # If slider values differ from live position, user adjusted manually
-      if (abs(input$slider_x - live_pos$x) > 0.01 || abs(input$slider_y - live_pos$y) > 0.01) {
-        live_crosshair(NULL)
-      }
+    if (is.null(live_pos) || is.null(input$slider_x) || is.null(input$slider_y)) return()
+
+    values_match <- abs(input$slider_x - live_pos$x) <= 0.01 &&
+                    abs(input$slider_y - live_pos$y) <= 0.01
+
+    # Check if we recently ended a drag (within 500ms)
+    time_since_drag_end <- as.numeric(Sys.time()) - drag_end_time()
+    recently_ended_drag <- time_since_drag_end < 0.5 && time_since_drag_end > 0
+
+    if (values_match && recently_ended_drag) {
+      # Sliders caught up after drag end - clear live_crosshair
+      live_crosshair(NULL)
+    } else if (!values_match) {
+      # User manually adjusted sliders - clear live_crosshair
+      live_crosshair(NULL)
     }
   }, ignoreInit = TRUE)
   
   output$recon_plot <- renderPlot({
     req(bundle_ok())
+    req(input$recon_mode, input$x_pc, input$y_pc)
     # Reference height to trigger re-render on resize
     input$recon_height
     df <- pcscores()
@@ -1265,7 +1343,11 @@ server <- function(input, output, session) {
 
     # Get color_by setting from scatter plot
     color_by <- input$color_by
-    use_color_by <- !is.null(color_by) && nzchar(color_by) && (color_by %in% names(df))
+    use_color_by <- is.character(color_by) &&
+      length(color_by) == 1 &&
+      !is.na(color_by) &&
+      nzchar(color_by) &&
+      (color_by %in% names(df))
 
     # parse selected x/y PCs
     pc_index <- function(pcname) as.integer(gsub("^PC", "", pcname))
@@ -1318,14 +1400,14 @@ server <- function(input, output, session) {
         key_val <- df[[key_name]][i]
 
         # Get color_by value for this point
-        if (use_color_by) {
+        if (isTRUE(use_color_by)) {
           color_val <- as.character(df[[color_by]][i])
         } else {
           color_val <- as.character(key_val)
         }
 
         # decide reconstruction mode
-        if (input$recon_mode == "obs") {
+        if (isTRUE(input$recon_mode == "obs")) {
           K <- min(input$K, p)
           y <- reconstruct_curve(mu_vec, phi_mat, scores_row, K = K)
         } else {
@@ -1344,7 +1426,7 @@ server <- function(input, output, session) {
     validate(need(has_content, "Use the sliders or click points on the scatter plot to reconstruct curves."))
 
     # Build title
-    if (input$recon_mode == "obs") {
+    if (isTRUE(input$recon_mode == "obs")) {
       mode_text <- paste0("K = ", min(input$K, p), " PCs")
     } else {
       mode_text <- paste0(input$x_pc, " + ", input$y_pc, " only")
@@ -1357,14 +1439,14 @@ server <- function(input, output, session) {
     endpoint_data <- plot_data %>%
       filter(type == "selected") %>%
       group_by(label) %>%
-      filter(time == max(time)) %>%
+      slice_max(order_by = time, n = 1, with_ties = FALSE) %>%
       ungroup()
 
     # Create a color mapping based on color_group using same palette as scatter plot
     unique_color_groups <- unique(plot_data$color_group[plot_data$type == "selected"])
 
     # Get all levels of color_by to ensure consistent color mapping
-    if (use_color_by) {
+    if (isTRUE(use_color_by)) {
       all_color_levels <- unique(as.character(df[[color_by]]))
       all_colors <- get_color_palette(length(all_color_levels))
       names(all_colors) <- all_color_levels
@@ -1392,7 +1474,7 @@ server <- function(input, output, session) {
     ylim_high <- input$recon_ylim_high
 
     # Determine legend title
-    legend_title <- if (use_color_by) color_by else key_name
+    legend_title <- if (isTRUE(use_color_by)) color_by else key_name
 
     plt <- ggplot(plot_data, aes(x = time, y = y, color = color_group, linetype = color_group, group = label)) +
       geom_line(linewidth = 1) +
@@ -1404,26 +1486,32 @@ server <- function(input, output, session) {
         y = ""
       ) +
       theme_minimal(base_size = 11) +
-      theme(legend.position = "right")
+      theme(
+        legend.position = "right",
+        plot.margin = margin(5.5, 40, 5.5, 5.5)  # Extra right margin for labels
+      )
 
-    # Add direct line labels for file names
+    # Add direct line labels for file names (simple fixed position, no repel)
     if (nrow(endpoint_data) > 0) {
       plt <- plt +
-        geom_label_repel(
+        geom_text(
           data = endpoint_data,
           aes(x = time, y = y, label = label),
-          nudge_x = 0.02 * diff(range(time_vals)),
-          direction = "y",
           hjust = 0,
+          nudge_x = 0.5,
           size = 3,
-          segment.size = 0.3,
           show.legend = FALSE
         )
     }
 
-    # Apply y-axis limits if set
-    if (!is.null(ylim_low) && !is.null(ylim_high)) {
-      plt <- plt + coord_cartesian(ylim = c(ylim_low, ylim_high))
+    # Apply y-axis limits if set, use clip="off" to allow labels outside panel
+    ylim_low  <- input$recon_ylim_low
+    ylim_high <- input$recon_ylim_high
+
+    if (is.finite(ylim_low) && is.finite(ylim_high)) {
+      plt <- plt + coord_cartesian(ylim = c(ylim_low, ylim_high), clip = "off")
+    } else {
+      plt <- plt + coord_cartesian(clip = "off")
     }
 
     plt
